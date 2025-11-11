@@ -1,97 +1,156 @@
-# Corrective AI (Streamlit)
+# Corrective AI — Address Correction (Streamlit)
 
-Streamlit app to **correct shipment addresses** (Google Geocoding) and **suggest HS codes** (SentenceTransformers).  
-**Mistral via Ollama is required** for natural-language command parsing.
+A lightweight Streamlit app to **detect address issues** in your CSV (via `Error Description`), **propose corrected addresses** using Google Geocoding, and let users **approve updates** row-by-row or apply all at once.
 
-## Requirements
-- **Python:** 3.10–3.12 (tested)
-- **Ollama + Mistral:** install Ollama, then `ollama pull mistral`
-- **Pip deps:** `pip install -r requirements.txt`
+---
 
-## Project Structure
-corrective-ai/
-├─ app.py
-├─ .env
-├─ requirements.txt
-├─ data/
-│ ├─ hs_codes_sample.csv
-│ └─ original.csv
-└─ src/corrective_ai/
-├─ config.py
-├─ logic/
-│ ├─ address.py
-│ ├─ hs_matching.py
-│ └─ intent.py
-├─ services/
-│ ├─ geocode.py
-│ ├─ embeddings.py
-│ └─ llm.py
-└─ ui/
-├─ chat.py
-└─ styles.py
+## ✨ Features
 
-shell
-Copy code
+- **Batch correction** – `fix all addresses` proposes corrections for every row with address-related errors.
+- **Single-row correction**
+  - by **Item Name**: `change the address for Blue Wallet`
+  - by **Reference**: `correct the address for EPG011042500542210 - Ref. #`
+  - by **Free-form address**: `correct the address for 123 Main St, Chicago IL` (returns a normalized address in chat)
+- **Review & apply**
+  - Proposals table with **Approve** checkbox per row
+  - **Apply Selected**, **Accept All**, **Reject All**
+  - Clears `Error` / `Error Description` once applied
+- **Fast & safe**
+  - Persistent **SQLite geocode cache**
+  - Simple **QPS limit** for API calls
 
-## Setup
+---
+
+## 📄 Input CSV
+
+Required (or auto-created) columns:
+
+- `Item Name`
+- `Destination Address 1`, `Destination Address 2`, `Destination Address 3`
+- `Destination City`, `Destination State`, `Destination ZIP`
+- `Destination Country`, `Destination Country Code`
+- `Error Description` *(used to decide which rows need correction)*
+- *(Optional)* `Error`
+
+> To target single rows by a reference value, include a column like **`Ref. #`** (common variants such as `Reference Number`, `Tracking Number` are auto-detected).
+
+**Include a tiny example file** (e.g., `sample_input.csv`) in the repo so others can try the UI quickly.
+
+---
+
+## 🚀 Quickstart
+
+### 1) Requirements
+- **Python 3.11+**
+- **Google Maps Geocoding API key**
+
+### 2) Install
 ```bash
 python -m venv .venv
-# Windows: .venv\Scripts\activate
-# macOS/Linux: source .venv/bin/activate
-pip install --upgrade pip
+# Windows
+.venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
+
 pip install -r requirements.txt
-# LLM setup (required)
-ollama pull mistral
-Environment (.env)
+3) Configure environment
+Create a .env in the repo root:
+
 env
 Copy code
-HS_CODE_CSV=data/hs_codes_sample.csv
-GOOGLE_MAPS_API_KEY=YOUR_KEY
-USE_LOCAL_LLM=true
-LLM_MODEL_NAME=mistral
-OLLAMA_BASE_URL=http://localhost:11434
-Run
+GOOGLE_MAPS_API_KEY=YOUR_KEY_HERE
+
+# Optional (defaults shown)
+GEOCODE_CACHE_DB=geocode_cache.sqlite
+GEOCODE_CACHE_TTL_SECS=86400
+GEOCODE_MAX_QPS=5
+AUDIT_LOG=audit_log.csv
+4) Run
 bash
 Copy code
 streamlit run app.py
-Input CSV (minimum columns)
-Item Name
+Open the URL Streamlit prints (e.g., http://localhost:8501).
 
-Package Description
+🧭 Using the App
+Upload your CSV (sidebar).
 
-Destination Address 1, Destination Address 2, Destination Address 3
+Type a command (lenient, conversational is fine). Examples:
 
-Destination City, Destination State, Destination ZIP
+fix all addresses
 
-Destination Country, Destination Country Code
+change the address for Blue Wallet
 
-Error Description (and optional Error)
+correct the address for EPG011042500542210 - Ref. #
 
-Commands (examples)
-Batch address: “fix all addresses”
+correct the address for 123 Main St, Springfield, IL
 
-Single address (by item): “change the address for Blue Wallet”
+Review the Proposals tab:
 
-Batch HS code: “fix all hs codes”
+Tick Approve on rows you want.
 
-Single HS (by item): “update hs code for Blue Wallet”
+Click Apply Selected or Accept All / Reject All.
 
-Free-form address: “correct the address for 123 Main St, Springfield, IL”
+The Results tab shows your live DataFrame; Download the updated CSV from the sidebar.
 
-Review & Apply: per-row OK/No + Accept All / Reject All.
+🔎 How errors are detected
+Rows are considered address-related if Error Description matches patterns such as:
 
-Notes
-Address issues are detected from Error Description (e.g., “Invalid Postal Code”, “Address1 is empty / has only special characters”, “OriginCountry is empty / has only special characters”). Extend patterns in logic/address.py.
+“Invalid Postal Code / ZIP”
 
-HS suggestions use all-MiniLM-L6-v2 embeddings.
+“Address1 is empty / has only special characters”
 
-Mistral (via Ollama) is used for intent parsing and must be available.
+“Origin/Destination Country/City/State is missing/invalid”
 
-Quick Troubleshooting
-HS_CODE_CSV not found: check path in .env.
+Non-address phrases (e.g., “has only special characters in item”) are ignored.
 
-Model load error (Torch): use the pinned versions in requirements.txt.
+You can override patterns in .env (semicolon ; separated regular expressions):
 
-Ollama errors: ensure ollama pull mistral completed and Ollama is running.
-
+env
 Copy code
+ADDR_PATTERNS=\binvalid\s*(postal\s*code|zip|zip\s*code|zipcode)\b;...
+NEG_ADDR_PATTERNS=\bhas\s+only\s+special\s+characters\s+in\s+item\b
+⚙️ Caching & Rate Limits
+Geocode results cached in geocode_cache.sqlite (configurable).
+
+Cache TTL default 24h (GEOCODE_CACHE_TTL_SECS).
+
+API calls throttled by GEOCODE_MAX_QPS (default 5).
+
+🧱 Folder Layout
+arduino
+Copy code
+.
+├─ app.py
+├─ requirements.txt
+├─ .env                  # not committed (contains API key)
+├─ sample_input.csv      # small example file
+└─ src/
+   └─ utils/
+      ├─ persistent_cache.py   # SQLite get/set by key
+      └─ rate_limit.py         # simple QPS limiter
+🛠️ Troubleshooting
+No proposals appear → Check that Error Description contains address-related issues (see patterns above).
+
+Single row not found → Use the hint suffix for references:
+
+correct the address for EPG011042500542210 - Ref. #
+
+Ensure your CSV has a matching reference column/value.
+
+API errors → Verify GOOGLE_MAPS_API_KEY, network access, and Google Cloud quotas.
+
+🌐 Deploying (brief)
+Provision a small VM (Linux/Windows), install Python 3.11+, then:
+
+bash
+Copy code
+pip install -r requirements.txt
+Add .env with your API key, then:
+
+bash
+Copy code
+streamlit run app.py
+Keep it running behind a reverse proxy (nginx/IIS) or a process manager (screen, pm2, systemd).
+
+Secure with firewall rules and HTTPS termination.
+
