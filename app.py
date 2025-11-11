@@ -5,6 +5,7 @@ import html
 import hashlib
 import asyncio
 import csv
+import difflib
 from datetime import datetime
 
 import requests
@@ -17,29 +18,33 @@ from urllib3.util.retry import Retry
 from src.utils.persistent_cache import cache_get, cache_set
 from src.utils.rate_limit import respect_qps
 
-# ---------- ENV & PAGE ----------
+
 load_dotenv()
 st.set_page_config(page_title="Corrective AI — Address Correction", layout="wide")
 
-# Windows event loop policy
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# ---------- CONFIG ----------
 USE_LOCAL_LLM = (os.getenv("USE_LOCAL_LLM", "false").lower() in ["1", "true", "yes"])
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "mistral")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 
-# persistent cache DB (file lives alongside app unless absolute path provided)
 GEOCODE_CACHE_DB = os.getenv("GEOCODE_CACHE_DB", "geocode_cache.sqlite")
 GEOCODE_CACHE_TTL = int(os.getenv("GEOCODE_CACHE_TTL_SECS", str(24 * 3600)))
 GEOCODE_MAX_QPS = int(os.getenv("GEOCODE_MAX_QPS", "5"))
 
-# audit log path
 AUDIT_LOG = os.getenv("AUDIT_LOG", "audit_log.csv")
 
-# ---------- HTTP SESSION (reused + retries) ----------
+SEARCH_COLS = [
+    "Item Name", "Item", "ItemName", "Item ID", "ItemID", "Item Code", "ItemCode", "SKU",
+
+    "Ref. #", "Ref.#", "Ref #", "Ref .#", "Reference #", "Reference Number",
+    "ReferenceNumber", "Reference", "Ref",
+    "EPG", "EPG Reference", "EPG Reference #",
+    "Tracking #", "Tracking#", "Tracking Number", "TrackingNumber",
+]
+
 def _build_session():
     s = requests.Session()
     retries = Retry(
@@ -55,7 +60,6 @@ def _build_session():
 
 HTTP = _build_session()
 
-# ---------- CSS ----------
 st.markdown("""
 <style>
 body, .stApp { background: #f7f8fb; color: #1f2937; }
@@ -72,12 +76,11 @@ body, .stApp { background: #f7f8fb; color: #1f2937; }
   border-radius: 8px; padding: 10px; margin-bottom: 8px; margin-left: 30%; text-align: right;
 }
 
-/* Slightly smaller grid font to reduce horizontal scrolling */
+/* data editor tweaks */
 [data-testid="stDataEditor"] table { font-size: 0.94rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- ADDRESS ERROR DETECTION (configurable from .env) ----------
 def _env_patterns(key: str, defaults: list[str]) -> list[str]:
     raw = (os.getenv(key, "") or "").strip()
     if not raw:
@@ -112,20 +115,12 @@ def is_address_error(text: str) -> bool:
             return True
     return False
 
-# ---------- CACHE HELPERS ----------
 def normalize_address_for_cache(s: str) -> str:
-    """Normalize a full-address string and hash it for stable in-memory keys (used in dedupe map)."""
     s = re.sub(r"\s+", " ", (s or "").strip().lower())
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-# ---------- GEOCODING (with persistent cache + QPS limit) ----------
 def correct_address(address: str):
-    """
-    Returns dict:
-      - {"formatted_address": "...", "components": [...]}
-      - or {"error_description_specific": "..."} / {"api_error": "..."}
-    Persistent cache is checked first; on miss we call Google and cache the result.
-    """
+
     if not GOOGLE_MAPS_API_KEY:
         return {"api_error": "Google Maps API key is missing. Set GOOGLE_MAPS_API_KEY in .env"}
 
@@ -133,12 +128,10 @@ def correct_address(address: str):
     if not addr or re.fullmatch(r"[\W_]+", addr):
         return {"error_description_specific": "Address input is empty or malformed."}
 
-    # 1) persistent cache
     hit = cache_get(GEOCODE_CACHE_DB, addr, ttl_secs=GEOCODE_CACHE_TTL)
     if hit is not None:
         return hit
 
-    # 2) external call (rate-limited)
     url = f"https://maps.googleapis.com/maps/api/geocode/json?address={addr}&key={GOOGLE_MAPS_API_KEY}"
     try:
         respect_qps(GEOCODE_MAX_QPS)
@@ -208,7 +201,7 @@ def parse_address_components(components):
         "Destination Country Code": parts["country_code"],
     }
 
-# ---------- Optional LLM (intent fallback) ----------
+
 def ollama_chat(prompt: str) -> str:
     try:
         r = HTTP.post(
@@ -221,13 +214,26 @@ def ollama_chat(prompt: str) -> str:
     except Exception as e:
         return f"[LLM error: {e}]"
 
-# ---------- INTENT PARSER (lenient) ----------
 ADDR_WORDS = [
     "address", "destination address", "city", "state", "zip", "postal", "postcode",
     "normalize address", "fix address", "clean address", "correct address", "change address",
 ]
 BATCH_WORDS = ["all", "every", "entire file", "bulk", "batch", "everything", "all rows"]
 SINGLE_VERBS = ["fix", "correct", "change", "update", "modify", "edit", "set"]
+
+COL_ALIAS_MAP = {
+    "ref. #": "Ref. #",
+    "ref.#": "Ref.#",
+    "ref #": "Ref #",
+    "ref .#": "Ref .#",
+    "reference #": "Reference #",
+    "reference number": "Reference Number",
+    "tracking #": "Tracking #",
+    "tracking number": "Tracking Number",
+    "item name": "Item Name",
+    "item": "Item Name",
+    "sku": "SKU",
+}
 
 def _contains_any(text: str, words) -> bool:
     t = text.lower()
@@ -240,9 +246,21 @@ def _extract_item_name(text: str, item_names):
             return name
     return None
 
+def _extract_hint_column(text: str) -> str | None:
+    m = re.search(r"\s-\s*([A-Za-z0-9 .#]+)\s*$", text.strip(), flags=re.IGNORECASE)
+    if not m:
+        return None
+    raw = m.group(1).strip().lower()
+    return COL_ALIAS_MAP.get(raw, None)
+
 def _extract_address_string(text: str):
-    m = re.search(r"(?:correct|fix|update|change)\s+the\s+address\s+for\s+(.+)", text, flags=re.IGNORECASE)
-    return m.group(1).strip() if m else None
+    m = re.search(r"(?:correct|fix|update|change)\s+the\s+address\s+for\s+(?:this\s+)?(.+)", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    s = m.group(1).strip()
+    # remove trailing " - <column>" if present
+    s = re.sub(r"\s-\s*[A-Za-z0-9 .#]+$", "", s)
+    return s
 
 def parse_user_intent(user_input: str, item_names):
     """
@@ -256,7 +274,7 @@ def parse_user_intent(user_input: str, item_names):
     matched_item = _extract_item_name(text, item_names)
     address_string = _extract_address_string(text)
 
-    # Rule-based (fast & deterministic)
+    # Rule-based
     if _contains_any(text, ADDR_WORDS) and _contains_any(text, BATCH_WORDS):
         return "batch_correct_addresses", None, None
     if _contains_any(text, ADDR_WORDS) and matched_item and any(v in text.lower() for v in SINGLE_VERBS):
@@ -280,7 +298,7 @@ If they provide a free-form address string ("correct the address for 123 Main...
 
 Return JSON ONLY with keys: intent, item_name, address_string (null when missing).
 Known item names: {list(item_names)}
-User: \"\"\"{text}\"\"\"
+User: \"\"\"{text}\"\"\" 
 JSON:
 """
     raw = ollama_chat(prompt)
@@ -302,7 +320,57 @@ JSON:
     except Exception:
         return None, None, None
 
-# ---------- SMALL UI HELPERS ----------
+def find_item_row(df: pd.DataFrame, query: str, preferred_col: str | None = None):
+
+    q = (query or "").strip().lower()
+    if not q or df.empty:
+        return None, None
+
+    def _try_column(col: str):
+        if col not in df.columns:
+            return None
+        series = df[col].astype(str).fillna("").str.strip()
+        exact_hits = df.index[series.str.lower() == q].tolist()
+        if exact_hits:
+            idx = exact_hits[0]
+            name = df.at[idx, "Item Name"] if "Item Name" in df.columns else series.loc[idx]
+            return idx, name
+        contains_hits = df.index[series.str.lower().str.contains(re.escape(q))].tolist()
+        if contains_hits:
+            idx = contains_hits[0]
+            name = df.at[idx, "Item Name"] if "Item Name" in df.columns else series.loc[idx]
+            return idx, name
+        return None
+
+    if preferred_col:
+        hit = _try_column(preferred_col)
+        if hit:
+            return hit
+
+    for col in SEARCH_COLS:
+        hit = _try_column(col)
+        if hit:
+            return hit
+
+    candidates = []
+    for col in SEARCH_COLS:
+        if col in df.columns:
+            candidates.extend(df[col].astype(str).fillna("").str.strip().tolist())
+    candidates = [c for c in set(candidates) if c]
+
+    best = difflib.get_close_matches(q, [c.lower() for c in candidates], n=1, cutoff=0.6)
+    if best:
+        target = best[0]
+        for col in SEARCH_COLS:
+            if col in df.columns:
+                hits = df.index[df[col].astype(str).str.strip().str.lower() == target].tolist()
+                if hits:
+                    idx = hits[0]
+                    name = df.at[idx, "Item Name"] if "Item Name" in df.columns else df.at[idx, col]
+                    return idx, name
+
+    return None, None
+
 def chat_bubble(sender, message):
     if sender == "bot":
         st.markdown(f'<div class="chat-bubble-bot">{html.escape(message)}</div>', unsafe_allow_html=True)
@@ -332,7 +400,6 @@ def audit_rows(applied_props: list[dict], df: pd.DataFrame):
                     if str(old) != str(new):
                         w.writerow([ts, user, idx, item, field, old, new])
 
-# ---------- STREAMLIT APP ----------
 async def async_main():
     st.title("Corrective AI — Address Correction")
 
@@ -351,7 +418,7 @@ async def async_main():
     if "review_msg" not in ss:
         ss.review_msg = ""
 
-    # ----------------- Sidebar: Actions -----------------
+    # Sidebar
     with st.sidebar:
         st.header("Actions")
         uploaded = st.file_uploader(
@@ -363,7 +430,7 @@ async def async_main():
         with st.form("cmd_form", clear_on_submit=True):
             user_input = st.text_input(
                 "Command (lenient)",
-                placeholder="e.g., fix all addresses / change the address for Blue Wallet / correct the address for 123 Main St..."
+                placeholder="e.g., fix all addresses / change the address for EPG011... - Ref. # / correct the address for 123 Main St..."
             )
             submitted = st.form_submit_button("Send")
 
@@ -390,9 +457,9 @@ async def async_main():
             st.rerun()
 
         st.markdown("**Examples:**")
-        st.markdown("- fix all addresses\n- change the address for **Blue Wallet**\n- correct the address for **123 Main St, Springfield, IL**")
+        st.markdown("- fix all addresses\n- change the address for **EPG011042500542210 - Ref. #**\n- correct the address for **Enzyme Science MyoMend 120 Capsu - Item Name**\n- correct the address for **123 Main St, Springfield, IL**")
 
-    # ----------------- Main: Tabs -----------------
+    # Tabs
     tab_proposals, tab_results, tab_chat = st.tabs(["Proposals", "Results", "Chat"])
 
     with tab_results:
@@ -409,7 +476,6 @@ async def async_main():
             if ss.review_msg:
                 st.info(ss.review_msg)
 
-            # Stable data_editor
             col_order = [
                 "Approve",
                 "Row Index", "Item Name",
@@ -426,12 +492,8 @@ async def async_main():
                 ),
                 "Row Index": st.column_config.NumberColumn("Row", width="small"),
                 "Item Name": st.column_config.TextColumn("Item", width="medium", max_chars=24),
-                "Original Full Address": st.column_config.TextColumn(
-                    "Original Full Address", width="large", max_chars=64
-                ),
-                "Proposed Full Address": st.column_config.TextColumn(
-                    "Proposed Full Address", width="large", max_chars=64
-                ),
+                "Original Full Address": st.column_config.TextColumn("Original Full Address", width="large", max_chars=64),
+                "Proposed Full Address": st.column_config.TextColumn("Proposed Full Address", width="large", max_chars=64),
                 "Proposed Address 1": st.column_config.TextColumn("Addr 1", width="medium", max_chars=28),
                 "Proposed Address 2": st.column_config.TextColumn("Addr 2", width="small", max_chars=18),
                 "Proposed Address 3": st.column_config.TextColumn("Addr 3", width="small", max_chars=18),
@@ -470,7 +532,7 @@ async def async_main():
                     selected_rows = edited_df[edited_df.get("Approve", False) == True]
                     selected_idxs = set(int(x) for x in selected_rows["Row Index"].tolist())
 
-                    # Build quick lookup for proposals by idx
+                    # map proposals by idx
                     pmap = {p["idx"]: p for p in ss.proposals}
                     applied_props = []
 
@@ -488,10 +550,9 @@ async def async_main():
                             df.at[idx, "Error Description"] = ""
                         applied_props.append(p)
 
-                    # audit
                     audit_rows(applied_props, df)
 
-                    # Remove applied from proposals
+                    # remove applied from proposals
                     remaining = [p for p in ss.proposals if p["idx"] not in selected_idxs]
                     ss.proposals = remaining
                     if remaining:
@@ -521,7 +582,6 @@ async def async_main():
                             df.at[idx, "Error Description"] = ""
                         applied_props.append(p)
 
-                    # audit
                     audit_rows(applied_props, df)
 
                     ss.results_df = df
@@ -539,7 +599,7 @@ async def async_main():
         else:
             st.info("No proposed corrections yet. Run a command like “fix all addresses”.")
 
-    # ----------------- Handle CSV upload -----------------
+    # CSV upload
     if 'uploaded' in locals() and uploaded and not ss.csv_loaded:
         try:
             dtype_map = {
@@ -571,12 +631,12 @@ async def async_main():
 
             ss.results_df = df
             ss.csv_loaded = True
-            ss.chat_history.append(("bot", "CSV uploaded. You can now say things like 'fix all addresses' or 'change the address for Blue Wallet'."))
+            ss.chat_history.append(("bot", "CSV uploaded. You can now say things like 'fix all addresses' or 'change the address for EPG011042500542210 - Ref. #'."))  # noqa: E501
             st.rerun()
         except Exception as e:
             st.error(f"Failed to read uploaded CSV: {e}")
 
-    # ----------------- Handle commands -----------------
+    # Commands
     if 'submitted' in locals() and submitted and (user_input or "").strip():
         ss.chat_history.append(("user", user_input))
         df = ss.results_df
@@ -587,8 +647,9 @@ async def async_main():
 
         item_names = list(df["Item Name"].dropna().unique()) if "Item Name" in df.columns else []
         intent, matched_item, address_string = parse_user_intent(user_input, item_names)
+        hint_col = _extract_hint_column(user_input)  # << recognize '- Ref. #' etc.
 
-        # ---- Batch address correction ----
+        # Batch address correction
         if intent == "batch_correct_addresses":
             ss.proposals = []
             ss.proposals_df = pd.DataFrame()
@@ -651,7 +712,7 @@ async def async_main():
             ss.chat_history.append(("bot", ss.review_msg))
             st.rerun()
 
-        # ---- Single address (by item name) ----
+        # Single address by item name (from intent)
         elif intent == "correct_address_for_item" and matched_item:
             rows = df.index[df["Item Name"] == matched_item].tolist()
             if not rows:
@@ -662,7 +723,7 @@ async def async_main():
 
             err_desc = (row.get("Error Description", "") or "").strip()
             if not is_address_error(err_desc):
-                ss.chat_history.append(("bot", f"No address-related issue found in Error Description for '{matched_item}'."))
+                ss.chat_history.append(("bot", f"No address-related issue found in Error Description for '{matched_item}'."))  # noqa: E501
                 st.rerun()
 
             parts = [
@@ -714,8 +775,67 @@ async def async_main():
                     ss.chat_history.append(("bot", f"Address correction failed: {err}"))
             st.rerun()
 
-        # ---- Free-form single address string ----
+        # Single address: token or literal (supports "- Ref. #" hints)
         elif intent == "correct_single_address" and address_string:
+            # First try to resolve the token to a row using hint column if present
+            idx, resolved_name = find_item_row(df, address_string, preferred_col=hint_col)
+            if idx is not None:
+                row = df.loc[idx]
+                err_desc = (row.get("Error Description", "") or "").strip()
+                if not is_address_error(err_desc):
+                    ss.chat_history.append(("bot", f"No address-related issue found in Error Description for '{resolved_name}'."))  # noqa: E501
+                    st.rerun()
+
+                parts = [
+                    row.get("Destination Address 1", "").strip(),
+                    row.get("Destination Address 2", "").strip(),
+                    row.get("Destination Address 3", "").strip(),
+                    row.get("Destination City", "").strip(),
+                    row.get("Destination State", "").strip(),
+                    row.get("Destination ZIP", "").strip(),
+                    row.get("Destination Country", "").strip(),
+                ]
+                original_full = ", ".join([p for p in parts if p])
+                if not original_full or re.fullmatch(r"[\W_]+", original_full):
+                    ss.chat_history.append(("bot", f"No valid original address found for '{resolved_name}' to correct."))
+                    st.rerun()
+
+                with st.spinner(f"Correcting address for '{resolved_name}'..."):
+                    corr = correct_address(original_full)
+                    if "formatted_address" in corr:
+                        comps = parse_address_components(corr["components"])
+                        if comps.get("Destination ZIP", "").strip():
+                            ss.proposals = [{
+                                "idx": idx,
+                                "item_name": resolved_name,
+                                "original_full": original_full,
+                                "formatted_new_address": corr["formatted_address"],
+                                "new_components": comps
+                            }]
+                            ss.proposals_df = pd.DataFrame([{
+                                "Row Index": idx,
+                                "Item Name": resolved_name,
+                                "Original Full Address": original_full,
+                                "Proposed Full Address": corr["formatted_address"],
+                                "Proposed Address 1": comps.get("Destination Address 1", ""),
+                                "Proposed Address 2": comps.get("Destination Address 2", ""),
+                                "Proposed Address 3": comps.get("Destination Address 3", ""),
+                                "Proposed City": comps.get("Destination City", ""),
+                                "Proposed State": comps.get("Destination State", ""),
+                                "Proposed ZIP": comps.get("Destination ZIP", ""),
+                                "Proposed Country": comps.get("Destination Country", ""),
+                                "Proposed Country Code": comps.get("Destination Country Code", ""),
+                                "Approve": False,
+                            }])
+                            ss.review_msg = f"Proposed correction for '{resolved_name}'."
+                        else:
+                            ss.chat_history.append(("bot", "Corrected address has no ZIP; not proposed."))
+                    else:
+                        err = corr.get("api_error") or corr.get("error_description_specific")
+                        ss.chat_history.append(("bot", f"Address correction failed: {err}"))
+                st.rerun()
+
+            # If not a row match, treat as literal free-form address
             with st.spinner(f"Correcting: {address_string}"):
                 corr = correct_address(address_string)
             if "formatted_address" in corr:
@@ -727,20 +847,11 @@ async def async_main():
                           comps.get("Destination State", ""),
                           comps.get("Destination Country", "")]
                 ss.chat_history.append(("bot",
-                    f"Formatted: {corr['formatted_address']} \nWithout ZIP: {', '.join([p for p in pretty if p])}"))
+                                        f"Formatted: {corr['formatted_address']} \nWithout ZIP: {', '.join([p for p in pretty if p])}"))
             else:
                 err = corr.get("api_error") or corr.get("error_description_specific")
                 ss.chat_history.append(("bot", f"Could not correct: {err}"))
             st.rerun()
-
-        else:
-            ss.chat_history.append(("bot", "I didn't catch that. Try: 'fix all addresses' or 'change the address for Blue Wallet'."))
-            st.rerun()
-
-    # Initial greeting
-    if not ss.csv_loaded and not ss.chat_history:
-        ss.chat_history.append(("bot", "Hello! Upload a CSV to get started."))
-        st.rerun()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,4 @@
-# src/corrective_ai/constants.py
 
-# Unwanted text cleaning patterns (kept from your original)
 UNWANTED_PATTERNS = [
     r'error\s*=\s*None',
     r'include_in_memory\s*=\s*False',
