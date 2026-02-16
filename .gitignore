@@ -11,11 +11,9 @@ htmlcov/
 .ipynb_checkpoints/
 
 # Envs / secrets
-.env
-.env.*
+
 .venv/
 venv/
-env/
 
 # IDE / OS
 .idea/

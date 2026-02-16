@@ -5,9 +5,7 @@ from typing import List, Tuple, Optional
 from src.corrective_ai.config import get_config
 from src.corrective_ai.services.llm import ollama_chat
 
-# -------------------------
-# Keyword / regex helpers
-# -------------------------
+
 ADDR_WORDS = [
     "address", "destination address", "city", "state", "zip", "postal", "postcode",
     "normalize address", "fix address", "clean address", "correct address", "change address",
@@ -31,22 +29,17 @@ def _contains_any(text: str, words: List[str]) -> bool:
 
 def _extract_item_name(text: str, item_names: List[str]) -> Optional[str]:
     t = text.lower()
-    # prefer longest match first
     for name in sorted(item_names, key=len, reverse=True):
         if name and name.lower() in t:
             return name
     return None
 
 def _extract_address_string(text: str) -> Optional[str]:
-    # Handle "correct the address for <...>" free-form inputs
     m = re.search(r"(?:correct|fix|update|change)\s+the\s+address\s+for\s+(.+)", text, flags=re.IGNORECASE)
     if m:
         return m.group(1).strip()
     return None
 
-# -------------------------
-# Public API
-# -------------------------
 def parse_user_intent(user_input: str, item_names: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Returns (intent, matched_item, address_string).
@@ -61,15 +54,12 @@ def parse_user_intent(user_input: str, item_names: List[str]) -> Tuple[Optional[
     if not text:
         return None, None, None
 
-    # 1) Rule-based first (fast & deterministic)
     matched_item = _extract_item_name(text, item_names)
     address_string = _extract_address_string(text)
 
-    # Batch address
     if _contains_any(text, ADDR_WORDS) and _contains_any(text, BATCH_WORDS):
         return "batch_correct_addresses", None, None
 
-    # Single address by item name
     if _contains_any(text, ADDR_WORDS) and matched_item and any(v in text.lower() for v in SINGLE_VERBS):
         return "correct_address_for_item", matched_item, None
 

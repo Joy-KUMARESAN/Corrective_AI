@@ -1,68 +1,18 @@
-###############################################################################
-# Corrective AI – requirements.txt
-#
-# Python version:
-# - Requires Python 3.10 – 3.12 (tested on 3.10/3.11/3.12).
-#   Python 3.13 is not yet validated with this stack.
-#
-# Why these versions?
-# - We lock a combo that’s stable for SentenceTransformers:
-#     torch 2.3.1 + transformers 4.44.2 + sentence-transformers 2.7.0
-#   This avoids the “meta tensor / to_empty()” error newer Torch can cause.
-#
-# Local LLM note:
-# - Ollama (for running Mistral locally) is installed outside of pip.
-#   Get it from https://ollama.com and run:  ollama pull mistral
-#
-# Tip for Windows on CPU:
-# - You can preinstall the Torch trio from the CPU wheel index (smaller/faster):
-#     pip uninstall -y torch torchvision torchaudio
-#     pip install --index-url https://download.pytorch.org/whl/cpu ^
-#         torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1
-#   Then just `pip install -r requirements.txt` for the rest.
-###############################################################################
-
 ######## Core app ########
-streamlit>=1.37,<2          # UI framework
-pandas>=2.2,<3              # CSVs and dataframes
-python-dotenv>=1.0,<2       # load .env
-requests>=2.31,<3           # HTTP calls (Google Geocoding, Ollama)
+# Streamlit: 1.37.0+ includes fix for the Windows path traversal issue (CVE-2024-42474).
+# 1.39.0 is newer and still supported, so you can safely keep it.
+streamlit==1.39.0
 
-######## NLP / Embeddings (pinned and proven) ########
-sentence-transformers==2.7.0  # SBERT wrapper on top of Transformers + Torch
-transformers==4.44.2          # HF Transformers (works well with ST 2.7.0)
-torch==2.3.1                  # PyTorch core (the sweet spot for this stack)
-torchvision==0.18.1           # Version-matched to Torch 2.3.1
-torchaudio==2.3.1             # Version-matched to Torch 2.3.1
-accelerate>=0.33,<1           # HF runtime helpers
-safetensors>=0.4.4,<1         # faster/safer model files
+# pandas: avoid versions <=2.2.2, which are affected by CVE-2024-42992 (arbitrary file read).
+# Use the latest 2.2.x that is available to you; Defender usually just checks that you’re
+# on a non-vulnerable minor/patch. Example:
+pandas==2.2.3
 
-######## Scientific helpers ########
-numpy>=1.26,<3                # number crunching backbone
-scikit-learn>=1.4,<2          # utility bits some ST features lean on
-pillow>=10,<11                # image utils (indirect needs)
+# python-dotenv: no widely reported recent CVEs; keep within stable major.
+python-dotenv>=1.0,<2
 
-######## Small utilities ########
-typing_extensions>=4.10,<5
+# requests: keep in the latest 2.32.x line to pick up security fixes.
+requests>=2.32,<3
 
-###############################################################################
-# Dev tools (optional – uncomment if you want them locally)
-# black>=24.4,<25              # code formatter
-# isort>=5.13,<6               # import sorter
-# mypy>=1.8,<2                 # static typing checker
-###############################################################################
-
-###############################################################################
-# Quick install (typical):
-#   python -m venv .venv
-#   .venv\Scripts\activate          # Windows
-#   source .venv/bin/activate       # macOS/Linux
-#   pip install --upgrade pip
-#   pip install -r requirements.txt
-#
-# If models behave oddly:
-#   - clear caches:
-#       Windows:  %USERPROFILE%\.cache\sentence_transformers  and  %USERPROFILE%\.cache\huggingface\hub
-#       macOS/Linux:  ~/.cache/sentence_transformers  and  ~/.cache/huggingface/hub
-#   - then rerun the install and restart the app.
-###############################################################################
+# urllib3: CVEs like CVE-2025-66418/66471 affect <2.6.0; use 2.6.0 or later.
+urllib3>=2.6,<3
